@@ -3,55 +3,28 @@ import numpy as np
 import geopandas as gpd
 import plotly.express as px
 from sklearn.preprocessing import StandardScaler
-from scipy.cluster.hierarchy import linkage, fcluster, dendrogram, set_link_color_palette
+from scipy.cluster.hierarchy import linkage, fcluster
 from gower import gower_matrix
-import matplotlib.pyplot as plt
 import requests
-import io
 import os
-from shapely.geometry import Polygon
 from sklearn.metrics import silhouette_score
-from scipy import stats
 from scipy.stats import kruskal, mannwhitneyu, chi2_contingency, fisher_exact
-import itertools
-import seaborn as sns
 from sklearn.linear_model import LinearRegression
-import matplotlib
-from io import StringIO
+import warnings
+warnings.filterwarnings('ignore')
 
-# Конфигурация
-REGIONS_DIR = "region_geojsons"
-REGION_FILES = {
-    "Крым": "crimea.geojson",
-    "Донецкая обл.": "donetsk.geojson",
-    "Луганская обл.": "fixed1.geojson",
-    "Херсонская обл.": "kherson.geojson",
-    "Запорожская обл.": "fixed2.geojson",
-    "Севастополь": "sevas.geojson"
-}
-
-# ============================================================================
-# 1. ФУНКЦИИ ЗАГРУЗКИ ДАННЫХ
-# ============================================================================
-
+# 1. ФУНКЦИЯ ЗАГРУЗКИ ДАННЫХ
 def load_data():
-    """Возвращает словарь с данными за разные годы"""
-    data = { }
-    }
-    return data
-
+    data = {}
 def combine_years(data):
-    """Объединяет данные за несколько лет, вычисляя средние значения"""
     combined = []
-    
     for year, df in data.items():
         df_year = df.copy()
         df_year['Год'] = year
         combined.append(df_year)
-    
     full_df = pd.concat(combined, ignore_index=True)
     
-    numeric_cols = ['N5', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
+    numeric_cols = ['ЕГИСЗ', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
     for col in numeric_cols:
         full_df[col] = pd.to_numeric(full_df[col], errors='coerce')
     
@@ -63,799 +36,278 @@ def combine_years(data):
     result = pd.concat([numeric_means, binary_last], axis=1).reset_index()
     return result
 
-# ============================================================================
 # 2. ФУНКЦИИ ДЛЯ АНАЛИЗА МУЛЬТИКОЛЛИНЕАРНОСТИ
-# ============================================================================
-
 def calculate_vif_corrected(dataframe, exclude_cols=None):
-    """
-    Корректное вычисление VIF без добавления константы
-    """
     if exclude_cols is None:
         exclude_cols = []
-    
     numeric_cols = dataframe.select_dtypes(include=[np.number]).columns.tolist()
     numeric_cols = [col for col in numeric_cols if col not in exclude_cols]
-    
     X = dataframe[numeric_cols].dropna()
-    
     if len(X) < len(numeric_cols) + 1:
         return None
-    
     vif_data = []
-    
     for i, col in enumerate(numeric_cols):
         X_temp = X.drop(columns=[col])
         y_temp = X[col]
-        
         if X_temp.shape[1] == 0:
             vif = np.nan
         else:
             model = LinearRegression(fit_intercept=True)
             model.fit(X_temp, y_temp)
             r_squared = model.score(X_temp, y_temp)
-            
-            if r_squared < 0.999:
-                vif = 1.0 / (1.0 - r_squared)
-            else:
-                vif = np.inf
-        
+            vif = 1.0 / (1.0 - r_squared) if r_squared < 0.999 else np.inf
         vif_data.append([col, vif])
-    
     vif_df = pd.DataFrame(vif_data, columns=['Переменная', 'VIF'])
-    vif_df = vif_df.sort_values('VIF', ascending=False)
-    
-    return vif_df
+    return vif_df.sort_values('VIF', ascending=False)
 
-def analyze_multicollinearity_complete(df, numeric_cols=None, binary_cols=None, 
+def analyze_multicollinearity_complete(df, numeric_cols=None, binary_cols=None,
                                       threshold_vif=10, threshold_corr=0.8, 
                                       threshold_cramers_v=0.5):
-    """
-    Полный анализ мультиколлинеарности для смешанных данных
-    """
+    """Полный анализ мультиколлинеарности (без графиков, только печать)"""
     print("\n" + "="*80)
-    print("ПОЛНЫЙ АНАЛИЗ МУЛЬТИКОЛЛИНЕАРНОСТИ (ЧИСЛОВЫЕ И БИНАРНЫЕ ПЕРЕМЕННЫЕ)")
+    print("ПОЛНЫЙ АНАЛИЗ МУЛЬТИКОЛЛИНЕАРНОСТИ")
     print("="*80)
     
-    if numeric_cols is None or binary_cols is None:
-        numeric_cols = ['N5', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
+    if numeric_cols is None:
+        numeric_cols = ['ЕГИСЗ', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
+    if binary_cols is None:
         binary_cols = ['Вендор', 'положение о ГИС']
     
-    print(f"\nЧисловые переменные ({len(numeric_cols)}): {', '.join(numeric_cols)}")
-    print(f"Бинарные переменные ({len(binary_cols)}): {', '.join(binary_cols)}")
+    print(f"\nЧисловые переменные: {', '.join(numeric_cols)}")
+    print(f"Бинарные переменные: {', '.join(binary_cols)}")
     
-    results = {
-        'numeric_variables': numeric_cols,
-        'binary_variables': binary_cols
-    }
+    results = {}
     
-    # 1. АНАЛИЗ ЧИСЛОВЫХ ПЕРЕМЕННЫХ
+    # 1. Числовые переменные: корреляции и VIF
     if numeric_cols:
-        print(f"\n{'='*60}")
-        print("АНАЛИЗ ЧИСЛОВЫХ ПЕРЕМЕННЫХ")
-        print('='*60)
-        
-        # 1.1 Корреляционный анализ
-        print(f"\n1. КОРРЕЛЯЦИОННЫЙ АНАЛИЗ (порог: |r| > {threshold_corr}):")
-        
+        print(f"\n--- АНАЛИЗ ЧИСЛОВЫХ ПЕРЕМЕННЫХ ---")
         numeric_df = df[numeric_cols].copy()
         corr_matrix_num = numeric_df.corr(method='spearman')
         
-        # Визуализация
-        plt.figure(figsize=(10, 8))
-        mask = np.triu(np.ones_like(corr_matrix_num, dtype=bool))
-        sns.heatmap(corr_matrix_num, mask=mask, annot=True, fmt=".2f", cmap="RdBu_r",
-                    center=0, square=True, linewidths=0.5, cbar_kws={"shrink": 0.8})
-        plt.title('Корреляционная матрица (числовые переменные)', fontsize=14, pad=20)
-        plt.tight_layout()
-        plt.savefig('correlation_numeric.png', dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        # Находим сильно коррелирующие пары
+        # Поиск сильно коррелирующих пар
         high_corr_numeric = []
         for i in range(len(corr_matrix_num.columns)):
             for j in range(i+1, len(corr_matrix_num.columns)):
                 corr_value = corr_matrix_num.iloc[i, j]
-                corr_abs = abs(corr_value)
-                if corr_abs > threshold_corr:
+                if abs(corr_value) > threshold_corr:
                     high_corr_numeric.append({
                         'Переменная_1': corr_matrix_num.columns[i],
                         'Переменная_2': corr_matrix_num.columns[j],
-                        'Корреляция': corr_value,
-                        'Абс_корреляция': corr_abs
+                        'Корреляция': corr_value
                     })
-        
         if high_corr_numeric:
-            print(f"\nОбнаружено {len(high_corr_numeric)} сильно коррелирующих пар:")
-            for pair in high_corr_numeric:
-                print(f"  • {pair['Переменная_1']} ↔ {pair['Переменная_2']}: r = {pair['Корреляция']:.3f}")
+            print(f"\nСильные корреляции (|r| > {threshold_corr}):")
+            for p in high_corr_numeric:
+                print(f"  {p['Переменная_1']} ↔ {p['Переменная_2']}: r = {p['Корреляция']:.3f}")
         else:
-            print(f"\nСильные корреляции (|r| > {threshold_corr}) не обнаружены")
-        
-        results['numeric_correlation_matrix'] = corr_matrix_num
+            print(f"\nСильных корреляций не обнаружено.")
         results['high_correlation_numeric'] = high_corr_numeric
         
-        # 1.2 VIF анализ
-        print(f"\n2. VIF АНАЛИЗ (порог мультиколлинеарности: VIF > {threshold_vif}):")
-        
-        vif_results = calculate_vif_corrected(df[numeric_cols], exclude_cols=[])
-        
+        # VIF
+        vif_results = calculate_vif_corrected(df[numeric_cols])
         if vif_results is not None:
-            print("\nVIF коэффициенты для числовых переменных:")
+            print("\nVIF коэффициенты:")
             print(vif_results.to_string(index=False, float_format=lambda x: f"{x:.2f}" if pd.notnull(x) else "nan"))
-            
-            # Визуализация VIF
-            plt.figure(figsize=(10, 6))
-            bars = plt.barh(vif_results['Переменная'], vif_results['VIF'])
-            
-            for bar, vif in zip(bars, vif_results['VIF']):
-                if pd.isnull(vif):
-                    bar.set_color('gray')
-                elif vif > threshold_vif:
-                    bar.set_color('red')
-                elif vif > 5:
-                    bar.set_color('orange')
-                else:
-                    bar.set_color('green')
-            
-            plt.axvline(x=threshold_vif, color='red', linestyle='--', 
-                       label=f'Критический порог (VIF = {threshold_vif})')
-            plt.axvline(x=5, color='orange', linestyle='--', alpha=0.5, 
-                       label='Предупреждение (VIF = 5)')
-            plt.xlabel('VIF', fontsize=12)
-            plt.title('VIF анализ числовых переменных', fontsize=14, pad=20)
-            plt.legend()
-            plt.grid(axis='x', alpha=0.3)
-            plt.tight_layout()
-            plt.savefig('vif_numeric.png', dpi=300, bbox_inches='tight')
-            plt.show()
-            
+            high_vif = vif_results[vif_results['VIF'] > threshold_vif]
+            if not high_vif.empty:
+                print(f"\n Переменные с VIF > {threshold_vif}:")
+                for _, row in high_vif.iterrows():
+                    print(f"  {row['Переменная']}: {row['VIF']:.1f}")
             results['vif_numeric'] = vif_results
-            
-            # Анализ результатов VIF
-            high_vif_numeric = vif_results[vif_results['VIF'] > threshold_vif]
-            if not high_vif_numeric.empty:
-                print(f"\n⚠ ВНИМАНИЕ: Высокий VIF у числовых переменных:")
-                for _, row in high_vif_numeric.iterrows():
-                    print(f"  • {row['Переменная']}: VIF = {row['VIF']:.1f}")
     
-    # 2. АНАЛИЗ БИНАРНЫХ ПЕРЕМЕННЫХ
+    # 2. Бинарные переменные: φ-коэффициент
     if binary_cols:
-        print(f"\n{'='*60}")
-        print("АНАЛИЗ БИНАРНЫХ (КАТЕГОРИАЛЬНЫХ) ПЕРЕМЕННЫХ")
-        print('='*60)
-        
+        print(f"\n--- АНАЛИЗ БИНАРНЫХ ПЕРЕМЕННЫХ ---")
         binary_df = df[binary_cols].copy()
-        
-        # 2.1 Коэффициент фи-корреляции
-        print(f"\n1. АНАЛИЗ СВЯЗИ МЕЖДУ БИНАРНЫМИ ПЕРЕМЕННЫМИ:")
-        print(f"   (коэффициент φ, порог: |φ| > {threshold_cramers_v})")
-        
         phi_matrix = pd.DataFrame(index=binary_cols, columns=binary_cols)
-        
         for i, var1 in enumerate(binary_cols):
             for j, var2 in enumerate(binary_cols):
                 if i == j:
                     phi_matrix.loc[var1, var2] = 1.0
                 else:
                     contingency = pd.crosstab(binary_df[var1], binary_df[var2])
-                    
-                    if contingency.shape == (2, 2):
-                        a = contingency.iloc[0, 0]
-                        b = contingency.iloc[0, 1]
-                        c = contingency.iloc[1, 0]
-                        d = contingency.iloc[1, 1]
-                        
+                    if contingency.shape == (2,2):
+                        a,b,c,d = contingency.iloc[0,0], contingency.iloc[0,1], contingency.iloc[1,0], contingency.iloc[1,1]
                         phi = (a*d - b*c) / np.sqrt((a+b)*(c+d)*(a+c)*(b+d))
                         phi_matrix.loc[var1, var2] = phi
                     else:
                         phi_matrix.loc[var1, var2] = np.nan
         
-        # Визуализация
-        plt.figure(figsize=(8, 6))
-        mask = np.triu(np.ones_like(phi_matrix.astype(float), dtype=bool))
-        sns.heatmap(phi_matrix.astype(float), mask=mask, annot=True, fmt=".2f", 
-                    cmap="RdBu_r", center=0, square=True, linewidths=0.5, 
-                    cbar_kws={"shrink": 0.8}, vmin=-1, vmax=1)
-        plt.title('Матрица φ-коэффициентов (бинарные переменные)', fontsize=14, pad=20)
-        plt.tight_layout()
-        plt.savefig('phi_matrix_binary.png', dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        # Находим сильно связанные пары
-        high_phi_pairs = []
+        high_phi = []
         for i in range(len(binary_cols)):
             for j in range(i+1, len(binary_cols)):
-                var1, var2 = binary_cols[i], binary_cols[j]
-                phi_val = phi_matrix.loc[var1, var2]
-                
+                phi_val = phi_matrix.iloc[i, j]
                 if pd.notnull(phi_val) and abs(phi_val) > threshold_cramers_v:
-                    high_phi_pairs.append({
-                        'Переменная_1': var1,
-                        'Переменная_2': var2,
-                        'Phi_коэффициент': phi_val,
-                        'Абс_значение': abs(phi_val),
-                        'Интерпретация': 'сильная' if abs(phi_val) > 0.7 else 
-                                        'умеренная' if abs(phi_val) > 0.5 else 'слабая'
-                    })
-        
-        if high_phi_pairs:
-            print(f"\nОбнаружено {len(high_phi_pairs)} пар с сильной связью:")
-            for pair in high_phi_pairs:
-                direction = "положительная" if pair['Phi_коэффициент'] > 0 else "отрицательная"
-                print(f"  • {pair['Переменная_1']} ↔ {pair['Переменная_2']}:")
-                print(f"    φ = {pair['Phi_коэффициент']:.3f} ({direction} связь, {pair['Интерпретация']})")
-        else:
-            print(f"\nСильные связи (|φ| > {threshold_cramers_v}) не обнаружены")
-        
-        results['phi_matrix_binary'] = phi_matrix
-        results['high_phi_pairs'] = high_phi_pairs
-        
-        # 2.2 Анализ распределения бинарных переменных
-        print(f"\n2. РАСПРЕДЕЛЕНИЕ БИНАРНЫХ ПЕРЕМЕННЫХ:")
+                    high_phi.append((binary_cols[i], binary_cols[j], phi_val))
+        if high_phi:
+            print(f"\nСильные связи (|φ| > {threshold_cramers_v}):")
+            for v1,v2,phi in high_phi:
+                print(f"  {v1} ↔ {v2}: φ = {phi:.3f}")
+                           
+        print("\nРаспределение бинарных переменных:")
         for var in binary_cols:
             if var in df.columns:
                 counts = df[var].value_counts()
                 total = counts.sum()
-                proportion = counts.get(1, 0) / total if total > 0 else 0
-                print(f"  • {var}:")
-                print(f"    Значения: {dict(counts)}")
-                print(f"    Доля '1': {proportion:.1%}")
-                if proportion < 0.1 or proportion > 0.9:
-                    print(f"    ⚠ Внимание: несбалансированная переменная!")
-    
-    # 3. СМЕШАННЫЙ АНАЛИЗ
-    if numeric_cols and binary_cols:
-        print(f"\n{'='*60}")
-        print("АНАЛИЗ СВЯЗИ МЕЖДУ ЧИСЛОВЫМИ И БИНАРНЫМИ ПЕРЕМЕННЫМИ")
-        print('='*60)
-        
-        print("\nТочечно-бисериальная корреляция (r_pb):")
-        
-        rpb_matrix = pd.DataFrame(index=binary_cols, columns=numeric_cols)
-        
-        for binary_var in binary_cols:
-            for numeric_var in numeric_cols:
-                valid_data = df[[binary_var, numeric_var]].dropna()
-                
-                if len(valid_data) > 0:
-                    group_0 = valid_data[valid_data[binary_var] == 0][numeric_var]
-                    group_1 = valid_data[valid_data[binary_var] == 1][numeric_var]
-                    
-                    if len(group_0) > 0 and len(group_1) > 0:
-                        mean_0 = group_0.mean()
-                        mean_1 = group_1.mean()
-                        std_all = valid_data[numeric_var].std()
-                        p = len(group_1) / len(valid_data)
-                        q = 1 - p
-                        
-                        if std_all > 0:
-                            r_pb = ((mean_1 - mean_0) / std_all) * np.sqrt(p * q)
-                            rpb_matrix.loc[binary_var, numeric_var] = r_pb
-                        else:
-                            rpb_matrix.loc[binary_var, numeric_var] = 0
-                    else:
-                        rpb_matrix.loc[binary_var, numeric_var] = np.nan
-                else:
-                    rpb_matrix.loc[binary_var, numeric_var] = np.nan
-        
-        # Визуализация
-        plt.figure(figsize=(12, 8))
-        sns.heatmap(rpb_matrix.astype(float), annot=True, fmt=".2f", cmap="RdBu_r",
-                    center=0, square=False, linewidths=0.5, cbar_kws={"shrink": 0.8})
-        plt.title('Точечно-бисериальная корреляция\n(бинарные × числовые переменные)', fontsize=14, pad=20)
-        plt.xlabel('Числовые переменные', fontsize=12)
-        plt.ylabel('Бинарные переменные', fontsize=12)
-        plt.tight_layout()
-        plt.savefig('point_biserial_correlation.png', dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        results['point_biserial_matrix'] = rpb_matrix
-    
-    # 4. ОБЩИЕ РЕКОМЕНДАЦИИ
-    print(f"\n{'='*60}")
-    print("ОБЩИЕ РЕКОМЕНДАЦИИ ДЛЯ КЛАСТЕРИЗАЦИИ")
-    print('='*60)
-    
-    issues_found = []
-    
-    if 'high_correlation_numeric' in results and results['high_correlation_numeric']:
-        issues_found.append(f"Числовые переменные: {len(results['high_correlation_numeric'])} сильных корреляций")
-    
-    if 'high_phi_pairs' in results and results['high_phi_pairs']:
-        issues_found.append(f"Бинарные переменные: {len(results['high_phi_pairs'])} сильных связей")
-    
-    if issues_found:
-        print("\n⚠ ОБНАРУЖЕНЫ ПОТЕНЦИАЛЬНЫЕ ПРОБЛЕМЫ:")
-        for issue in issues_found:
-            print(f"  • {issue}")
-        
-        print("\nРЕКОМЕНДАЦИИ:")
-        print("  1. Для сильно связанных бинарных переменных:")
-        print("     - Удалите одну из пары (если они измеряют похожие аспекты)")
-        print("     - Или создайте составной индикатор")
-        
-        print("\n  2. Для кластеризации со смешанными данными:")
-        print("     - Используйте расстояние Говера (как вы уже делаете)")
-        print("     - Убедитесь, что веса переменных сбалансированы")
-        
-    else:
-        print("\n✓ ПРОБЛЕМ МУЛЬТИКОЛЛИНЕАРНОСТИ НЕ ОБНАРУЖЕНО")
-        print("  Все переменные подходят для кластеризации")
-    
+                prop1 = counts.get(1,0)/total if total>0 else 0
+                print(f"  {var}: доля '1' = {prop1:.1%}")
+        results['high_phi_pairs'] = high_phi
+              
     return results
 
-# ============================================================================
-# 3. ФУНКЦИИ ДЛЯ КЛАСТЕРНОГО АНАЛИЗА
-# ============================================================================
-
-def gower_cluster_analysis(df):
-    """Кластерный анализ с использованием расстояния Говера"""
-    numeric_cols = ['N5', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
+# 3. КЛАСТЕРНЫЙ АНАЛИЗ
+def gower_cluster_analysis(df, n_clusters=3):
+    numeric_cols = ['ЕГИСЗ', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
     binary_cols = ['Вендор', 'положение о ГИС']
     
     for col in binary_cols:
         if col in df.columns:
-            df[col] = df[col].apply(lambda x: 1 if str(x).lower() in ['1', 'да', 'yes', 'true'] else 0)
+            df[col] = df[col].apply(lambda x: 1 if str(x).lower() in ['1','да','yes','true'] else 0)
     
-    numeric_cols = [col for col in numeric_cols if col in df.columns]
-    binary_cols = [col for col in binary_cols if col in df.columns]
+    numeric_cols = [c for c in numeric_cols if c in df.columns]
+    binary_cols = [c for c in binary_cols if c in df.columns]
     all_cols = numeric_cols + binary_cols
-    
     if len(all_cols) < 2:
-        raise ValueError("Недостаточно переменных для кластерного анализа")
-    
-    regions = df['Регион'].values if 'Регион' in df.columns else [f"Объект {i}" for i in range(len(df))]
+        raise ValueError("Мало переменных")
     
     X = df[all_cols].copy()
-   # if numeric_cols:
-     #   scaler = StandardScaler()
-     #   X[numeric_cols] = scaler.fit_transform(X[numeric_cols])
-    
     gower_dist = gower_matrix(X)
     Z = linkage(gower_dist, method='ward')
+    cluster_labels = fcluster(Z, n_clusters, criterion='maxclust')
+    df['Cluster'] = cluster_labels
     
-    silhouette_scores = []
-    max_clusters = min(10, len(X)-1)
-    for k in range(2, max_clusters+1):
-        labels = fcluster(Z, k, criterion='maxclust')
-        if len(set(labels)) > 1:
-            score = silhouette_score(gower_dist, labels, metric='precomputed')
-            silhouette_scores.append(score)
-        else:
-            silhouette_scores.append(0)
+    df['Cluster_Distance'] = 0.0
+    for cluster in range(1, n_clusters+1):
+        idx = np.where(df['Cluster'] == cluster)[0]
+        if len(idx) > 0:
+            sub = gower_dist[idx][:, idx]
+            df.loc[df['Cluster']==cluster, 'Cluster_Distance'] = sub.mean(axis=1)
     
-    optimal_k = 3
+    print(f"\nКластеризация завершена. Число кластеров: {n_clusters}")
+    for c in range(1, n_clusters+1):
+        cnt = (df['Cluster']==c).sum()
+        print(f"  Кластер {c}: {cnt} регионов")
+    return df
 
-# ============================================================================
-# 4. ФУНКЦИИ ДЛЯ ВИЗУАЛИЗАЦИИ И АНАЛИЗА
-# ============================================================================
-
-def load_region_polygons():
-    """Загружает полигоны из GeoJSON-файлов"""
-    gdf = gpd.GeoDataFrame(columns=['name', 'geometry'], crs="EPSG:4326")
-    
-    for region_name, filename in REGION_FILES.items():
-        try:
-            filepath = os.path.join(REGIONS_DIR, filename)
-            if not os.path.exists(filepath):
-                print(f"Файл не найден: {filepath}")
-                continue
-                
-            region_gdf = gpd.read_file(filepath)
-            if not region_gdf.empty:
-                gdf = pd.concat([
-                    gdf,
-                    gpd.GeoDataFrame({
-                        'name': [region_name],
-                        'geometry': [region_gdf.geometry.iloc[0]]
-                    }, crs="EPSG:4326")
-                ], ignore_index=True)
-        except Exception as e:
-            print(f"Ошибка загрузки {region_name}: {str(e)}")
-    
-    return gdf
-
-def load_russia_contour_map():
-    """Загружает основную карту России и добавляет регионы из файлов"""
-    try:
-        print("Загрузка основной карты России...")
-        url = "https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/russia.geojson"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        ru_gdf = gpd.read_file(StringIO(response.text))
-        
-        print("Загрузка новых регионов из файлов...")
-        new_regions = load_region_polygons()
-        
-        if not new_regions.empty:
-            print(f"Добавлено регионов: {len(new_regions)}")
-            ru_gdf = gpd.GeoDataFrame(
-                pd.concat([ru_gdf, new_regions], ignore_index=True),
-                crs="EPSG:4326"
-            )
-        
-        ru_gdf['name'] = ru_gdf['name'].str.replace('Республика ', '')
-        ru_gdf['name'] = ru_gdf['name'].str.replace('область', 'обл.')
-        ru_gdf['name'] = ru_gdf['name'].str.strip()
-        
-        return ru_gdf
-        
-    except Exception as e:
-        print(f"Ошибка загрузки карты: {str(e)}")
-        return None
-
-def plot_clusters_on_map(df):
-    """Визуализация кластеров на карте"""
-    gdf = load_russia_contour_map()
-    if gdf is None:
-        return
-    
-    df['Регион'] = df['Регион'].str.replace('Республика ', '')
-    df['Регион'] = df['Регион'].str.replace('область', 'обл.')
-    df['Регион'] = df['Регион'].str.replace('город федерального значения', '')
-    df['Регион'] = df['Регион'].str.replace('Республика Крым', 'Крым')
-    df['Регион'] = df['Регион'].str.strip()
-    
-    merged = gdf.merge(df, left_on='name', right_on='Регион', how='left')
-    merged['Cluster'] = merged['Cluster'].fillna(0).astype(int)
-    
-    fig = px.choropleth_mapbox(
-        merged,
-        geojson=merged.geometry,
-        locations=merged.index,
-        color='Cluster',
-        hover_name='name',
-        hover_data=['N5', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии'],
-        mapbox_style="carto-positron",
-        zoom=2,
-        center={"lat": 62, "lon": 94},
-        opacity=0.7,
-        color_continuous_scale='Viridis'
-    )
-    
-    fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
-    fig.show()
-
+# 4. АНАЛИЗ КЛАСТЕРОВ
 def analyze_clusters(df):
-    """Анализ кластеров с выводом статистики"""
-    print("\n=== АНАЛИЗ КЛАСТЕРОВ ===")
-    
-    if 'Cluster' not in df.columns:
-        print("ОШИБКА: Отсутствует столбец 'Cluster'!")
-        return None
-    
-    numeric_cols = ['N5', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
+    print("\n=== СТАТИСТИКА ПО КЛАСТЕРАМ ===")
+    numeric_cols = ['ЕГИСЗ', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
     binary_cols = ['Вендор', 'положение о ГИС']
-    
-    for col in numeric_cols + binary_cols:
-        try:
+    for col in numeric_cols+binary_cols:
+        if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-        except:
-            if col in binary_cols:
-                df[col] = df[col].astype(str).str.lower().str.strip()
-                df[col] = df[col].replace({'да': 1, 'нет': 0, 'yes': 1, 'no': 0, '1': 1, '0': 0})
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
     stats = df.groupby('Cluster').agg({
-        'N5': 'median',
-        'Кол. МО': 'median',
-        'Интернет': 'median',
-        'Обеспеч. врачами': 'median',
-        'Субсидии': 'median',
-        'Вендор': lambda x: f"{x.mean():.1%}",
-        'положение о ГИС': lambda x: f"{x.mean():.1%}",
-        'Cluster_Distance': 'mean',
+        **{col: 'median' for col in numeric_cols if col in df.columns},
+        **{col: lambda x: f"{x.mean():.1%}" for col in binary_cols if col in df.columns},
         'Регион': 'count'
     }).rename(columns={'Регион': 'Регионов'})
     
-    stats['Cluster_Distance'] = stats['Cluster_Distance'].round(3)
-    
-    print("\nТАБЛИЦА СРЕДНИХ ЗНАЧЕНИЙ ПО КЛАСТЕРАМ:")
+    print("\nМедианные значения по кластерам:")
     print(stats.to_string(float_format="%.2f"))
-    
     return stats
 
 def calculate_statistical_tests_fixed(df):
-    """
-    Статистические тесты для кластерного анализа
-    """
     print("\n" + "="*80)
-    print("СТАТИСТИЧЕСКИЕ ТЕСТЫ ЗНАЧИМОСТИ")
+    print("СТАТИСТИЧЕСКИЕ ТЕСТЫ")
     print("="*80)
     
-    numeric_vars = ['N5', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
+    numeric_vars = ['ЕГИСЗ', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
     binary_vars = ['Вендор', 'положение о ГИС']
+    numeric_vars = [v for v in numeric_vars if v in df.columns]
+    binary_vars = [v for v in binary_vars if v in df.columns]
     
-    numeric_vars = [var for var in numeric_vars if var in df.columns]
-    binary_vars = [var for var in binary_vars if var in df.columns]
-    
-    print(f"Числовые переменные: {numeric_vars}")
-    print(f"Бинарные переменные: {binary_vars}")
-    
-    for var in numeric_vars + binary_vars:
-        df[var] = pd.to_numeric(df[var], errors='coerce')
-    
-    results = []
-    
-    # 1. ТЕСТЫ ДЛЯ ЧИСЛОВЫХ ПЕРЕМЕННЫХ
-    print("\n1. ТЕСТ КРУСКАЛА-УОЛЛИСА ДЛЯ ЧИСЛОВЫХ ПЕРЕМЕННЫХ")
-    print("-" * 60)
-    
-    for var in numeric_vars:
-        try:
-            groups = [df[df['Cluster'] == cluster][var].dropna().values 
-                     for cluster in sorted(df['Cluster'].unique())]
-            groups = [g for g in groups if len(g) > 0]
-            if len(groups) >= 2:
-                stat, p_value = kruskal(*groups)
-                significance = '***' if p_value < 0.001 else '**' if p_value < 0.01 else '*' if p_value < 0.05 else 'не значимо'
-                
-                results.append({
-                    'Тип': 'Числовая', 
-                    'Переменная': var,
-                    'Тест': 'Kruskal-Wallis',
-                    'Статистика': stat,
-                    'p-value': p_value,
-                    'Значимость': significance
-                })
-                print(f"{var}: H = {stat:.4f}, p = {p_value:.4f} {significance}")
-        except Exception as e:
-            print(f"Ошибка в тесте Крускала-Уоллис для {var}: {e}")
-    
-    # 2. ТЕСТЫ ДЛЯ БИНАРНЫХ ПЕРЕМЕННЫХ
-    print("\n2. ТЕСТ ХИ-КВАДРАТ ДЛЯ БИНАРНЫХ ПЕРЕМЕННЫХ")
-    print("-" * 60)
-    
+    # Хи-квадрат
+    print("\n--- ХИ-КВАДРАТ ДЛЯ БИНАРНЫХ ПЕРЕМЕННЫХ ---")
     for var in binary_vars:
-        try:
-            contingency = pd.crosstab(df['Cluster'], df[var])
-            print(f"\n{var}:")
-            print("Таблица сопряженности:")
-            print(contingency)
-            
-            if contingency.shape[0] >= 2 and contingency.shape[1] >= 2:
-                chi2, p_value, dof, expected = chi2_contingency(contingency)
-                significance = '***' if p_value < 0.001 else '**' if p_value < 0.01 else '*' if p_value < 0.05 else 'не значимо'
-                
-                results.append({
-                    'Тип': 'Бинарная',
-                    'Переменная': var,
-                    'Тест': 'Chi-square',
-                    'Статистика': chi2,
-                    'p-value': p_value,
-                    'Значимость': significance
-                })
-                print(f"Хи-квадрат = {chi2:.4f}, p = {p_value:.4f} {significance}")
-        except Exception as e:
-            print(f"Ошибка в тесте хи-квадрат для {var}: {e}")
+        cont = pd.crosstab(df['Cluster'], df[var])
+        if cont.shape[1] >= 2:
+            chi2, p, dof, _ = chi2_contingency(cont)
+            sig = '***' if p<0.001 else '**' if p<0.01 else '*' if p<0.05 else 'н.з.'
+            print(f"{var:20} χ²={chi2:.4f}, p={p:.4f} {sig}")
+        else:
+            print(f"{var:20} недостаточно данных")
     
-    results_df = pd.DataFrame(results)
-    
-    if not results_df.empty:
-        print("\nСВОДНЫЕ РЕЗУЛЬТАТЫ:")
-        print(results_df.to_string(index=False, float_format="%.4f"))
-    else:
-        print("Не удалось рассчитать статистические тесты")
-    
-    # 3. ПОПАРНЫЕ СРАВНЕНИЯ
-    print("\n\n3. ПОПАРНЫЕ СРАВНЕНИЯ МЕЖДУ КЛАСТЕРАМИ")
-    print("=" * 80)
-    
+    # Попарные сравнения
+    print("\n--- ПОПАРНЫЕ СРАВНЕНИЯ ---")
     clusters = sorted(df['Cluster'].unique())
-    pairwise_results = []
-    
-    print("\n--- ЧИСЛОВЫЕ ПЕРЕМЕННЫЕ ---")
     for var in numeric_vars:
-        for i in range(len(clusters)):
-            for j in range(i + 1, len(clusters)):
-                cluster1, cluster2 = clusters[i], clusters[j]
-                try:
-                    data1 = df[df['Cluster'] == cluster1][var].dropna()
-                    data2 = df[df['Cluster'] == cluster2][var].dropna()
-                    
-                    if len(data1) > 0 and len(data2) > 0:
-                        stat, p_value = mannwhitneyu(data1, data2)
-                        significance = '***' if p_value < 0.001 else '**' if p_value < 0.01 else '*' if p_value < 0.05 else ''
-                        
-                        if p_value < 0.1:
-                            pairwise_results.append({
-                                'Тип': 'Числовая',
-                                'Переменная': var,
-                                'Сравнение': f"{cluster1} vs {cluster2}",
-                                'p-value': p_value,
-                                'Значимость': significance,
-                                'Среднее1': data1.mean(),
-                                'Среднее2': data2.mean()
-                            })
-                            print(f"{var}: {cluster1} vs {cluster2} - p = {p_value:.4f} {significance}")
-                except Exception as e:
-                    print(f"Ошибка в попарном сравнении {var} {cluster1} vs {cluster2}: {e}")
-    
-    print("\n--- БИНАРНЫЕ ПЕРЕМЕННЫЕ ---")
+        for i, c1 in enumerate(clusters):
+            for c2 in clusters[i+1:]:
+                d1 = df[df['Cluster']==c1][var].dropna()
+                d2 = df[df['Cluster']==c2][var].dropna()
+                if len(d1)>0 and len(d2)>0:
+                    _, p = mannwhitneyu(d1, d2)
+                    if p < 0.05:
+                        print(f"{var}: кластер {c1} vs {c2} -> p={p:.4f}")
     for var in binary_vars:
-        for i in range(len(clusters)):
-            for j in range(i + 1, len(clusters)):
-                cluster1, cluster2 = clusters[i], clusters[j]
-                try:
-                    subset = df[df['Cluster'].isin([cluster1, cluster2])]
-                    contingency = pd.crosstab(subset['Cluster'], subset[var])
-                    
-                    if contingency.shape == (2, 2):
-                        oddsratio, p_value = fisher_exact(contingency)
-                        significance = '***' if p_value < 0.001 else '**' if p_value < 0.01 else '*' if p_value < 0.05 else ''
-                        
-                        if p_value < 0.05:
-                            prop1 = contingency.loc[cluster1, 1] / contingency.loc[cluster1].sum()
-                            prop2 = contingency.loc[cluster2, 1] / contingency.loc[cluster2].sum()
-                            
-                            pairwise_results.append({
-                                'Тип': 'Бинарная',
-                                'Переменная': var,
-                                'Сравнение': f"{cluster1} vs {cluster2}",
-                                'p-value': p_value,
-                                'Значимость': significance,
-                                'Доля1': prop1,
-                                'Доля2': prop2
-                            })
-                            print(f"{var}: {cluster1} vs {cluster2} - p = {p_value:.4f} {significance}")
-                except Exception as e:
-                    print(f"Ошибка в попарном сравнении {var} {cluster1} vs {cluster2}: {e}")
-    
-    pairwise_df = pd.DataFrame(pairwise_results)
-    
-    if not pairwise_df.empty:
-        print("\nЗНАЧИМЫЕ ПОПАРНЫЕ РАЗЛИЧИЯ (p < 0.05):")
-        print(pairwise_df.to_string(index=False, float_format="%.4f"))
-    else:
-        print("\nНет значимых попарных различий (p < 0.05)")
-    
-    return results_df, pairwise_df
+        for i, c1 in enumerate(clusters):
+            for c2 in clusters[i+1:]:
+                sub = df[df['Cluster'].isin([c1,c2])]
+                cont = pd.crosstab(sub['Cluster'], sub[var])
+                if cont.shape == (2,2):
+                    _, p = fisher_exact(cont)
+                    if p < 0.05:
+                        print(f"{var}: кластер {c1} vs {c2} -> p={p:.4f}")
 
-# ============================================================================
-# 5. ОСНОВНОЙ БЛОК ВЫПОЛНЕНИЯ
-# ============================================================================
+# 5. ВИЗУАЛИЗАЦИЯ КАРТЫ
+def load_region_polygons():
+    gdf = gpd.GeoDataFrame(columns=['name', 'geometry'], crs="EPSG:4326")
+    for name, fname in REGION_FILES.items():
+        path = os.path.join(REGIONS_DIR, fname)
+        if os.path.exists(path):
+            region = gpd.read_file(path)
+            if not region.empty:
+                gdf = pd.concat([gdf, gpd.GeoDataFrame({'name':[name], 'geometry':[region.geometry.iloc[0]]}, crs="EPSG:4326")], ignore_index=True)
+    return gdf
 
+def load_russia_contour_map():
+    try:
+        url = "https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/russia.geojson"
+        ru = gpd.read_file(url)
+        new = load_region_polygons()
+        if not new.empty:
+            ru = pd.concat([ru, new], ignore_index=True)
+        ru['name'] = ru['name'].str.replace('Республика ', '').str.replace('область', 'обл.').str.strip()
+        return ru
+    except Exception as e:
+        print("Ошибка загрузки карты:", e)
+        return None
+
+def plot_clusters_on_map(df):
+    gdf = load_russia_contour_map()
+    if gdf is None:
+        return
+    df = df.copy()
+    df['Регион'] = df['Регион'].str.replace('Республика ', '').str.replace('область', 'обл.').str.replace('Республика Крым', 'Крым').str.strip()
+    merged = gdf.merge(df, left_on='name', right_on='Регион', how='left')
+    merged['Cluster'] = merged['Cluster'].fillna(0).astype(int)
+    fig = px.choropleth_mapbox(merged, geojson=merged.geometry, locations=merged.index,
+                                color='Cluster', hover_name='name',
+                                hover_data=['ЕГИСЗ','Кол. МО','Интернет','Обеспеч. врачами','Субсидии'],
+                                mapbox_style="carto-positron", zoom=2, center={"lat":62,"lon":94},
+                                opacity=0.7, color_continuous_scale='Viridis')
+    fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
+    fig.show()
+
+# ОСНОВНОЙ БЛОК
 if __name__ == "__main__":
-    print("=== ЗАПУСК ПОЛНОГО АНАЛИЗА ===")
-    
-    # 1. Загрузка и объединение данных
-    print("\n1. ЗАГРУЗКА И ОБЪЕДИНЕНИЕ ДАННЫХ...")
     yearly_data = load_data()
-    combined_data = combine_years(yearly_data)
+    df = combine_years(yearly_data)
     
-    print("\nПервые 5 строк объединенных данных:")
-    print(combined_data.head())
-    print(f"\nВсего регионов: {len(combined_data)}")
+    # Анализ мультиколлинеарности
+    mc_res = analyze_multicollinearity_complete(df)
     
-    # 2. ПОЛНЫЙ АНАЛИЗ МУЛЬТИКОЛЛИНЕАРНОСТИ
-    print("\n2. ПОЛНЫЙ АНАЛИЗ МУЛЬТИКОЛЛИНЕАРНОСТИ...")
+    # Кластеризация
+    n_clusters = 3
+    df_clustered = gower_cluster_analysis(df, n_clusters=n_clusters)
     
-    numeric_vars = ['N5', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии']
-    binary_vars = ['Вендор', 'положение о ГИС']
+    # Статистика по кластерам
+    stats = analyze_clusters(df_clustered)
     
-    mc_results = analyze_multicollinearity_complete(
-        combined_data,
-        numeric_cols=numeric_vars,
-        binary_cols=binary_vars,
-        threshold_vif=10,
-        threshold_corr=0.7,
-        threshold_cramers_v=0.5
-    )
+    # Статистические тесты
+    calculate_statistical_tests_fixed(df_clustered)
     
-    # 3. ПОДГОТОВКА ДАННЫХ ДЛЯ КЛАСТЕРИЗАЦИИ
-    print("\n3. ПОДГОТОВКА ДАННЫХ ДЛЯ КЛАСТЕРИЗАЦИИ...")
-    
-    # Проверяем, нужно ли удалять переменные
-    data_for_clustering = combined_data.copy()
-    
-    high_corr_pairs = mc_results.get('high_correlation_numeric', [])
-    high_phi_pairs = mc_results.get('high_phi_pairs', [])
-    
-    vars_to_remove = []
-    
-    # Автоматическая обработка сильно коррелирующих числовых переменных
-    if high_corr_pairs:
-        print("\nОбнаружены сильные корреляции. Автоматическая обработка...")
-        
-        # Находим переменные с высоким VIF для удаления
-        vif_results = mc_results.get('vif_numeric')
-        if vif_results is not None:
-            high_vif_vars = vif_results[vif_results['VIF'] > 10]['Переменная'].tolist()
-            vars_to_remove.extend(high_vif_vars)
-            
-            if high_vif_vars:
-                print(f"Будут удалены переменные с VIF > 10: {', '.join(high_vif_vars)}")
-    
-    # Обработка сильно связанных бинарных переменных
-    if high_phi_pairs:
-        print("\nОбнаружены сильные связи между бинарными переменными:")
-        for pair in high_phi_pairs:
-            if abs(pair['Phi_коэффициент']) > 0.7:  # Очень сильная связь
-                # Оставляем только одну переменную из пары
-                vars_to_remove.append(pair['Переменная_2'])
-                print(f"  Удаляем {pair['Переменная_2']} (сильно связана с {pair['Переменная_1']})")
-    
-    # Удаляем выбранные переменные
-    if vars_to_remove:
-        vars_to_remove = list(set(vars_to_remove))
-        data_for_clustering = data_for_clustering.drop(columns=vars_to_remove)
-        print(f"\nУдалено {len(vars_to_remove)} переменных: {', '.join(vars_to_remove)}")
-    
-    print(f"\nДля кластеризации используется {len(data_for_clustering.columns)} переменных")
-    
-    # 4. КЛАСТЕРНЫЙ АНАЛИЗ
-    print("\n4. ВЫПОЛНЕНИЕ КЛАСТЕРНОГО АНАЛИЗА...")
-    clustered_data = gower_cluster_analysis(data_for_clustering)
-    
-    # 5. ВЫВОД РЕЗУЛЬТАТОВ КЛАСТЕРИЗАЦИИ
-    print("\n5. РЕЗУЛЬТАТЫ КЛАСТЕРНОГО АНАЛИЗА:")
-    
-    pd.set_option('display.max_rows', None)
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', 1000)
-    
-    result_cols = ['Регион', 'Cluster', 'Cluster_Distance'] + \
-                 [col for col in clustered_data.columns if col not in ['Регион', 'Cluster', 'Cluster_Distance']]
-    
-    print("\nПервые 10 строк результатов:")
-    print(clustered_data[result_cols].sort_values(['Cluster', 'Cluster_Distance']).head(90).to_string(index=False))
-    
-    # 6. АНАЛИЗ КЛАСТЕРОВ
-    print("\n6. СТАТИСТИЧЕСКИЙ АНАЛИЗ КЛАСТЕРОВ...")
-    stats = analyze_clusters(clustered_data)
-    
-    # 7. СТАТИСТИЧЕСКИЕ ТЕСТЫ
-    print("\n7. ВЫПОЛНЕНИЕ СТАТИСТИЧЕСКИХ ТЕСТОВ...")
-    kruskal_results, pairwise_results = calculate_statistical_tests_fixed(clustered_data)
-    
-    # 8. ВИЗУАЛИЗАЦИЯ
-    print("\n8. ВИЗУАЛИЗАЦИЯ РЕЗУЛЬТАТОВ...")
-    
-    print("\nПостроение карты кластеров...")
-    plot_clusters_on_map(clustered_data)
-    
-    # 9. СОХРАНЕНИЕ РЕЗУЛЬТАТОВ
-    print("\n9. СОХРАНЕНИЕ РЕЗУЛЬТАТОВ...")
-    
-    # Сохраняем все данные
-    clustered_data.to_excel('final_clusters.xlsx', index=False)
-    
-    if stats is not None:
-        stats.to_excel('cluster_stats.xlsx')
-    
-    # Сохраняем результаты мультиколлинеарности
-    with pd.ExcelWriter('multicollinearity_results.xlsx') as writer:
-        if 'numeric_correlation_matrix' in mc_results:
-            mc_results['numeric_correlation_matrix'].to_excel(writer, sheet_name='correlation_matrix')
-        
-        if 'vif_numeric' in mc_results and mc_results['vif_numeric'] is not None:
-            mc_results['vif_numeric'].to_excel(writer, sheet_name='vif_results', index=False)
-        
-        if 'phi_matrix_binary' in mc_results:
-            mc_results['phi_matrix_binary'].to_excel(writer, sheet_name='phi_matrix')
-        
-        if 'point_biserial_matrix' in mc_results:
-            mc_results['point_biserial_matrix'].to_excel(writer, sheet_name='point_biserial')
-    
-    # Сохраняем статистические тесты
-    with pd.ExcelWriter('statistical_tests_results.xlsx') as writer:
-        if kruskal_results is not None:
-            kruskal_results.to_excel(writer, sheet_name='Kruskal_Wallis', index=False)
-        if pairwise_results is not None:
-            pairwise_results.to_excel(writer, sheet_name='Pairwise_Comparisons', index=False)
-    
-    print("\n✓ РЕЗУЛЬТАТЫ СОХРАНЕНЫ В ФАЙЛЫ:")
-    print("  - final_clusters.xlsx (кластеризация)")
-    print("  - cluster_stats.xlsx (статистика кластеров)")
-    print("  - multicollinearity_results.xlsx (анализ мультиколлинеарности)")
-    print("  - statistical_tests_results.xlsx (статистические тесты)")
-    print("  - dendrogram_regions.png (дендрограмма)")
-    print("  - correlation_numeric.png (корреляционная матрица)")
-    print("  - vif_numeric.png (VIF анализ)")
-    print("  - phi_matrix_binary.png (связи бинарных переменных)")
-    print("  - point_biserial_correlation.png (связи числовых и бинарных переменных)")
-    
-    print("\n" + "="*80)
-    print("АНАЛИЗ УСПЕШНО ЗАВЕРШЕН!")
-    print("="*80)
+    # Карта кластеров
+    plot_clusters_on_map(df_clustered)
