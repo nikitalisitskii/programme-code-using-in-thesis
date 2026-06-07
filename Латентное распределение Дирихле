@@ -1,0 +1,202 @@
+import nltk
+import re
+from nltk.corpus import stopwords
+from nltk.stem.snowball import RussianStemmer
+from gensim.models import LdaModel
+from gensim.corpora import Dictionary
+import PyPDF2
+import pandas as pd
+
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
+# Загрузка набора стоп-слов
+stop_words = set(stopwords.words('russian'))
+
+# Упрощенные стоп-слова
+custom_stop_words = {'который', 'возможных', 'возможного', 'возможные', 'возможность', 'возможн', 'которого','которых', 'которые', 'как', 'является', 'что', 'некоторой', 'некоторых', 'иллюстрац', 'так', 'это', 'эт'
+    'при', 'и', 'в', 'на', 'с', 'по', 'для', 'г', 'котор', 'например', 'край', 'год', 'медицинск', 'могут', 'перелом', 'являются', 'осуществлен', 'содерж', 'котор', 'некотор', 'могут', 'получен', 'явля'
+}
+
+stop_words.update(custom_stop_words)
+
+stemmer = RussianStemmer()
+
+def preprocess_text(text):
+    if not text or not isinstance(text, str):
+        return []
+    
+    text = text.lower()
+    
+     text = re.sub(r'[^а-яё\s]', ' ', text)
+    
+    text = re.sub(r'\s+', ' ', text).strip()
+  
+    tokens = text.split()
+        
+    words = [word for word in tokens if word not in stop_words and len(word) > 2]
+        
+    stemmed_words = [stemmer.stem(word) for word in words]
+    
+    return stemmed_words
+
+def extract_text_from_pdf(pdf_path):
+    try:
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            text = ""
+            
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+            
+            return text
+    except Exception as e:
+        print(f"Ошибка чтения PDF: {e}")
+        return ""
+
+def split_into_documents(text, min_length=3000):
+    if not text:
+        return []
+    
+    # Разделяем по двойным переводам строк или большим отступам
+    documents = re.split(r'\n\s*\n', text)
+    
+    # Фильтруем слишком короткие документы
+    documents = [doc.strip() for doc in documents if len(doc.strip()) > min_length]
+    
+    return documents
+
+pdf_path = 'Desktop\патенты.pdf'
+
+print("Чтение PDF файла...")
+raw_text = extract_text_from_pdf(pdf_path)
+
+if not raw_text:
+    print("Не удалось прочитать файл или файл пустой")
+    exit()
+
+print(f"Прочитано символов: {len(raw_text)}")
+
+print("Разделение на документы...")
+documents = split_into_documents(raw_text, min_length=30)
+print(f"Получено документов: {len(documents)}")
+
+# Выводим первые 3 документа для проверки
+print("\nПримеры документов:")
+for i, doc in enumerate(documents[:3]):
+    print(f"Документ {i+1}: {doc[:100]}...")
+
+print("\nПредобработка текстов...")
+preprocessed_documents = []
+
+for i, doc in enumerate(documents):
+    processed = preprocess_text(doc)
+    if processed and len(processed) >= 3:  # Минимум 3 слова
+        preprocessed_documents.append(processed)
+    
+    if i % 100 == 0 and i > 0:
+        print(f"Обработано {i} документов")
+
+print(f"После предобработки осталось документов: {len(preprocessed_documents)}")
+
+# Проверяем, есть ли данные для анализа
+if len(preprocessed_documents) == 0:
+    print("Нет данных для анализа. Проверьте файл и предобработку.")
+    exit()
+
+print("Создание словаря...")
+dictionary = Dictionary(preprocessed_documents)
+
+# Фильтруем слишком частые и слишком редкие слова
+dictionary.filter_extremes(no_below=2, no_above=0.8)
+print(f"Размер словаря после фильтрации: {len(dictionary)}")
+
+print("Создание корпуса...")
+corpus = [dictionary.doc2bow(doc) for doc in preprocessed_documents]
+
+# Проверяем корпус
+if len(corpus) == 0:
+    print("Корпус пустой. Недостаточно данных.")
+    exit()
+
+print(f"Размер корпуса: {len(corpus)}")
+
+# Обучение модели LDA
+print("Обучение модели LDA...")
+try:
+    lda_model = LdaModel(
+        corpus=corpus,
+        id2word=dictionary,
+        num_topics=20,
+        alpha='auto',
+        eta='auto',
+        iterations=50,
+        passes=10,
+        random_state=42,
+        per_word_topics=True
+    )
+    
+    # Вывод тем
+    print("\nТемы:")
+    for idx, topic in lda_model.print_topics(num_words=10):
+        print(f"Тема {idx}: {topic}")
+    
+    # Coherence score
+    from gensim.models.coherencemodel import CoherenceModel
+    coherence_model = CoherenceModel(
+        model=lda_model, 
+        texts=preprocessed_documents, 
+        dictionary=dictionary, 
+        coherence='c_v'
+    )
+    coherence = coherence_model.get_coherence()
+    print(f"\nCoherence Score: {coherence:.4f}")
+    
+    # Визуализация
+    try:
+        import pyLDAvis
+        import pyLDAvis.gensim_models
+        import tempfile
+        import webbrowser
+        import os
+        
+        print("Создание визуализации...")
+        vis_data = pyLDAvis.gensim_models.prepare(lda_model, corpus, dictionary)
+        
+        # Сохраняем в файл
+        html_content = pyLDAvis.prepared_data_to_html(vis_data)
+        
+        if html_content and len(html_content) > 1000:  # Проверяем, что контент не пустой
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
+                f.write(html_content)
+                print(f"Визуализация сохранена в: {f.name}")
+                webbrowser.open(f'file://{os.path.abspath(f.name)}')
+        else:
+            print("Визуализация не содержит данных")
+            
+    except Exception as e:
+        print(f"Ошибка визуализации: {e}")
+        print("Установите: pip install pyLDAvis")
+    
+except Exception as e:
+    print(f"Ошибка обучения модели: {e}")
+
+# Дополнительная диагностика
+print("\nДиагностика:")
+print(f"Всего документов: {len(documents)}")
+print(f"Документов после предобработки: {len(preprocessed_documents)}")
+print(f"Размер словаря: {len(dictionary)}")
+
+# Примеры обработанных документов
+print("\nПримеры обработанных документов:")
+for i, doc in enumerate(preprocessed_documents[:2]):
+    print(f"Док {i+1}: {' '.join(doc[:10])}...")
