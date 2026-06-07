@@ -255,7 +255,7 @@ else:
 sufficient = truth[truth['sufficient']] if len(truth) > 0 else pd.DataFrame()
 
 if not sufficient.empty:
-    print("\n--- ДОСТАТОЧНЫЕ КОНФИГУРАЦИИ (ПУТИ) ---")
+    print("\n--- ДОСТАТОЧНЫЕ КОНФИГУРАЦИИ ---")
     paths_list = []
     all_covered_regions = set()
     
@@ -266,8 +266,8 @@ if not sufficient.empty:
         path_str = " * ".join(path_expr)
         
         print(f"\nПуть {idx+1}: {path_str}")
-        print(f"  Консистентность: {row['outcome_mean']:.3f}")
-        print(f"  Сырое покрытие: {row['raw_coverage']:.3f}")
+        print(f"  Согласованность: {row['outcome_mean']:.3f}")
+        print(f"  Покрытие: {row['raw_coverage']:.3f}")
         print(f"  Регионов в пути: {row['n_cases']}")
         if row['n_cases'] > 0:
             cases_str = ', '.join(row['cases'][:5])
@@ -310,8 +310,8 @@ if not sufficient.empty:
     paths_save = pd.DataFrame([
         {
             'Путь': p['path'],
-            'Консистентность': round(p['consistency'], 3),
-            'Сырое_покрытие': round(p['raw_coverage'], 3),
+            'Согласованность': round(p['consistency'], 3),
+            'Покрытие': round(p['raw_coverage'], 3),
             'Регионов': p['n_cases'],
             'Регионы': ', '.join(p['regions'][:5]) + ('...' if len(p['regions']) > 5 else '')
         }
