@@ -1,0 +1,321 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+
+data = {
+   }
+
+df = pd.DataFrame(data)
+print("Исходные данные загружены. Размерность:", df.shape)
+print("\nПервые 5 строк:")
+print(df.head())
+
+# ФУНКЦИИ ДЛЯ КАЛИБРОВКИ
+
+def calibrate_linear(x, p0, p05, p1):
+    """Линейная калибровка"""
+    if x <= p0:
+        return 0.0
+    elif x >= p1:
+        return 1.0
+    else:
+        return 1 / (1 + np.exp(-((x - p05) / (p1 - p0) * 9.2)))
+
+def calibrate_log(x, p0, p05, p1):
+    """Логарифмическая калибровка"""
+    x_safe = max(x, 0)
+    x_log = np.log1p(x_safe)
+    p0_log = np.log1p(max(p0, 0))
+    p05_log = np.log1p(max(p05, 0))
+    p1_log = np.log1p(max(p1, 0))
+    
+    if x_log <= p0_log:
+        return 0.0
+    elif x_log >= p1_log:
+        return 1.0
+    else:
+        return 1 / (1 + np.exp(-((x_log - p05_log) / (p1_log - p0_log) * 9.2)))
+
+def select_calibration_method(data, var):
+    """Статистически обоснованный выбор метода калибровки"""
+    values = data[var].dropna()
+    
+    cv = values.std() / values.mean() if values.mean() != 0 else float('inf')
+    skewness = stats.skew(values)
+    
+    use_log = False
+    reason = []
+    
+    if cv > 1.0:
+        use_log = True
+        reason.append(f"высокий коэф.вариации ({cv:.2f})")
+    if skewness > 1.5:
+        use_log = True
+        reason.append(f" ({skewness:.2f})")
+    if var in ['Субсидии', 'Кол. МО']:
+        use_log = True
+        reason.append("")
+    
+    # Определение порогов
+    if var == 'Кол. МО':
+        data_without_outliers = values[values < values.quantile(0.99)]
+        p0 = data_without_outliers.quantile(0.05)
+        p05 = data_without_outliers.quantile(0.50)
+        p1 = data_without_outliers.quantile(0.95)
+    elif var == 'Субсидии':
+        p0 = values.quantile(0.10)
+        p05 = values.quantile(0.50)
+        p1 = values.quantile(0.90)
+    else:
+        p0 = values.quantile(0.05)
+        p05 = values.quantile(0.50)
+        p1 = values.quantile(0.95)
+    
+    # Защита от совпадения порогов
+    if p0 == p05 or p05 == p1:
+        p0 = values.min()
+        p1 = values.max()
+        p05 = values.median()
+    
+    return {
+        'var': var,
+        'use_log': use_log,
+        'p0': p0,
+        'p05': p05,
+        'p1': p1,
+        'cv': cv,
+        'skewness': skewness,
+        'reason': '; '.join(reason) if reason else ""
+    }
+
+# ПРИМЕНЕНИЕ КАЛИБРОВКИ
+
+continuous_vars = ['ЕГИСЗ', 'Кол. МО', 'Интернет', 'Обеспеч. врачами', 'Субсидии', 'Прокси-показатель результ. платформы']
+binary_vars = ['Вендор', 'положение о ГИС']
+
+print("\n" + "="*70)
+print("СТАТИСТИЧЕСКИЙ АНАЛИЗ И ВЫБОР МЕТОДА КАЛИБРОВКИ")
+print("="*70)
+
+calibration_params = {}
+for var in continuous_vars:
+    params = select_calibration_method(df, var)
+    calibration_params[var] = params
+    
+    print(f"\n{var}:")
+    print(f"  Коэф.вариации: {params['cv']:.3f}")
+    print(f"  Асимметрия: {params['skewness']:.3f}")
+    print(f"  Метод: {'ЛОГАРИФМИЧЕСКИЙ' if params['use_log'] else 'ЛИНЕЙНЫЙ'}")
+    #print(f"  Причина: {params['reason']}")
+    print(f"  Пороги: p0={params['p0']:.1f}, p05={params['p05']:.1f}, p1={params['p1']:.1f}")
+
+df_cal = df.copy()
+
+for var in continuous_vars:
+    params = calibration_params[var]
+    
+    if params['use_log']:
+        df_cal[f'{var}_fuzzy'] = df[var].apply(
+            lambda x: calibrate_log(x, params['p0'], params['p05'], params['p1'])
+        )
+        method = 'LOG'
+    else:
+        df_cal[f'{var}_fuzzy'] = df[var].apply(
+            lambda x: calibrate_linear(x, params['p0'], params['p05'], params['p1'])
+        )
+        method = 'LIN'
+    
+    print(f"  {var}: калибровка {method} завершена")
+
+for var in binary_vars:
+    df_cal[var] = df[var].astype(int)
+outcome = 'Прокси-показатель результ. платформы_fuzzy'   # целевая переменная
+
+conditions_short = {
+    'ЕГИСЗ_fuzzy': 'ЕГИСЗ',
+    'Кол. МО_fuzzy': 'КолМО',
+    'Интернет_fuzzy': 'Интернет',
+    'Обеспеч. врачами_fuzzy': 'Врачи',
+    'Субсидии_fuzzy': 'Субсидии',
+    'Вендор': 'Вендор',
+    'положение о ГИС': 'ПолГИС'
+}
+conditions = list(conditions_short.keys())
+
+# ВИЗУАЛИЗАЦИЯ КАЛИБРОВКИ
+fig, axes = plt.subplots(2, len(continuous_vars), figsize=(20, 12))
+fig.suptitle('Преобразование исходных количественных показателей в степени принадлежности к нечеткому множеству', fontsize=14)
+
+for idx, var in enumerate(continuous_vars):
+    params = calibration_params[var]
+    
+    ax1 = axes[0, idx]
+    ax1.hist(df[var], bins=30, alpha=0.7, color='skyblue', edgecolor='black', density=True)
+    ax1.set_title(f'{var} - исходное', fontsize=12)
+    ax1.set_xlabel('Исходные значения')
+    ax1.set_ylabel('Плотность')
+    ax1.axvline(params['p0'], color='red', linestyle='--', linewidth=2, label=f'0: {params["p0"]:.1f}')
+    ax1.axvline(params['p05'], color='green', linestyle='--', linewidth=2, label=f'0.5: {params["p05"]:.1f}')
+    ax1.axvline(params['p1'], color='blue', linestyle='--', linewidth=2, label=f'1: {params["p1"]:.1f}')
+    ax1.legend(fontsize=7)
+
+    ax2 = axes[1, idx]
+    ax2.hist(df_cal[f'{var}_fuzzy'], bins=30, alpha=0.7, color='lightgreen', edgecolor='black', density=True)
+    ax2.axvline(0.5, color='red', linestyle='--', linewidth=2, label='кроссовер (0.5)')
+    ax2.set_title(f'{var} - калибровка', fontsize=12)
+    ax2.set_xlabel('Значение нечёткого множества')
+    ax2.set_ylabel('Плотность')
+    ax2.set_xlim(0, 1)
+    ax2.legend(fontsize=7)
+
+plt.tight_layout()
+plt.savefig('expert_calibration_with_platform.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# ФУНКЦИИ ДЛЯ fsQCA АНАЛИЗА
+
+def necessity_analysis(df, conditions, outcome):
+    results = []
+    for cond in conditions:
+        consistency = (np.minimum(df[cond], df[outcome]).sum()) / df[outcome].sum()
+        coverage = df[cond].sum() / len(df)
+        results.append({'condition': cond, 'consistency': consistency, 'coverage': coverage})
+    return pd.DataFrame(results)
+
+def truth_table_with_metrics(df, conditions, outcome, cons_threshold=0.8, min_cases=2):
+    df_bin = df.copy()
+    for cond in conditions:
+        df_bin[cond + '_bin'] = (df[cond] > 0.5).astype(int)
+    
+    bin_cols = [cond + '_bin' for cond in conditions]
+    
+    truth = df_bin.groupby(bin_cols).agg(
+        n_cases=(outcome, 'count'),
+        outcome_mean=(outcome, 'mean'),
+        cases=('Регион', lambda x: list(x))
+    ).reset_index()
+    
+    rename_dict = {cond + '_bin': conditions_short[cond] for cond in conditions}
+    truth.rename(columns=rename_dict, inplace=True)
+    truth = truth.sort_values(['outcome_mean', 'n_cases'], ascending=[False, False])
+    
+    high_outcome_mask = df[outcome] > 0.6
+    total_high = high_outcome_mask.sum()
+    
+    raw_coverages = []
+    for _, row in truth.iterrows():
+        mask = pd.Series(True, index=df.index)
+        for cond_short, val in zip(conditions_short.values(), [row[cond_short] for cond_short in conditions_short.values()]):
+            original_cond = [k for k, v in conditions_short.items() if v == cond_short][0]
+            if val == 1:
+                mask &= (df[original_cond] > 0.5)
+            else:
+                mask &= (df[original_cond] <= 0.5)
+        covered_high = (mask & high_outcome_mask).sum()
+        raw_cov = covered_high / total_high if total_high > 0 else 0
+        raw_coverages.append(raw_cov)
+    
+    truth['raw_coverage'] = raw_coverages
+    truth['sufficient'] = truth['outcome_mean'] >= cons_threshold
+    truth = truth[truth['n_cases'] >= min_cases].reset_index(drop=True)
+    return truth, total_high
+
+print("\n" + "="*70)
+print("FSQCA АНАЛИЗ: эффективность платформы (outcome = Прокси-показатель результ. платформы_fuzzy)")
+print("="*70)
+print(f"Всего регионов: {len(df)}")
+
+# Анализ необходимости
+necessity = necessity_analysis(df_cal, conditions, outcome)
+necessity['condition'] = necessity['condition'].map(conditions_short)
+print("\n--- АНАЛИЗ НЕОБХОДИМОСТИ ---")
+print(necessity.round(3).to_string(index=False))
+
+# Таблица истинности
+cons_threshold = 0.6
+min_cases = 2
+truth, total_high = truth_table_with_metrics(df_cal, conditions, outcome, 
+                                              cons_threshold=cons_threshold, 
+                                              min_cases=min_cases)
+
+print(f"\n--- ТАБЛИЦА ИСТИННОСТИ (cons_threshold={cons_threshold}, min_cases={min_cases}) ---")
+print(f"Всего регионов с высоким outcome (Прокси-показатель результ. платформы_fuzzy > 0.5): {total_high}")
+if len(truth) > 0:
+    truth_display = truth.copy()
+    truth_display['outcome_mean'] = truth_display['outcome_mean'].round(3)
+    truth_display['raw_coverage'] = truth_display['raw_coverage'].round(3)
+    cols_order = list(conditions_short.values()) + ['n_cases', 'outcome_mean', 'raw_coverage', 'sufficient']
+    print(truth_display[cols_order].to_string())
+else:
+    print("Таблица истинности пуста")
+
+# Достаточные пути
+sufficient = truth[truth['sufficient']] if len(truth) > 0 else pd.DataFrame()
+
+if not sufficient.empty:
+    print("\n--- ДОСТАТОЧНЫЕ КОНФИГУРАЦИИ (ПУТИ) ---")
+    paths_list = []
+    all_covered_regions = set()
+    
+    for idx, row in sufficient.iterrows():
+        path_expr = []
+        for short in conditions_short.values():
+            path_expr.append(short if row[short] == 1 else f"~{short}")
+        path_str = " * ".join(path_expr)
+        
+        print(f"\nПуть {idx+1}: {path_str}")
+        print(f"  Консистентность: {row['outcome_mean']:.3f}")
+        print(f"  Сырое покрытие: {row['raw_coverage']:.3f}")
+        print(f"  Регионов в пути: {row['n_cases']}")
+        if row['n_cases'] > 0:
+            cases_str = ', '.join(row['cases'][:5])
+            if len(row['cases']) > 5:
+                cases_str += f" и ещё {len(row['cases'])-5}"
+            print(f"  Регионы: {cases_str}")
+        
+        paths_list.append({
+            'path': path_str,
+            'consistency': row['outcome_mean'],
+            'raw_coverage': row['raw_coverage'],
+            'n_cases': row['n_cases'],
+            'regions': row['cases']
+        })
+        all_covered_regions.update(row['cases'])
+    
+    solution_coverage = len(all_covered_regions) / total_high if total_high > 0 else 0
+    print(f"\n--- ОБЩЕЕ ПОКРЫТИЕ РЕШЕНИЯ ---")
+    print(f"Всего уникальных регионов с высоким outcome, покрытых путями: {len(all_covered_regions)} из {total_high}")
+    print(f"Общее покрытие (solution coverage): {solution_coverage:.3f}")
+else:
+    print("\nНет достаточных путей при заданных порогах")
+
+calibration_df = pd.DataFrame([
+    {
+        'Переменная': params['var'],
+        'Метод': 'ЛОГ' if params['use_log'] else 'ЛИН',
+        'p0': round(params['p0'], 2),
+        'p05': round(params['p05'], 2),
+        'p1': round(params['p1'], 2),
+        'Коэф_вариации': round(params['cv'], 3),
+        'Асимметрия': round(params['skewness'], 3),
+        'Обоснование': params['reason']
+    }
+    for params in calibration_params.values()
+])
+calibration_df.to_csv('calibration_platform.csv', index=False, encoding='utf-8-sig')
+
+if not sufficient.empty:
+    paths_save = pd.DataFrame([
+        {
+            'Путь': p['path'],
+            'Консистентность': round(p['consistency'], 3),
+            'Сырое_покрытие': round(p['raw_coverage'], 3),
+            'Регионов': p['n_cases'],
+            'Регионы': ', '.join(p['regions'][:5]) + ('...' if len(p['regions']) > 5 else '')
+        }
+        for p in paths_list
+    ])
+    paths_save.to_csv('paths_platform.csv', index=False, encoding='utf-8-sig')
+ print("\nАнализ завершён!")
